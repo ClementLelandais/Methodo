@@ -11,17 +11,20 @@ L’objectif est de proposer un pipeline automatique capable de :
 
 ---
 
-## 📁 Structure du projet
+## Structure du projet
 
-•	automl.py # Pipeline AutoML principal
-•	dataio.py # Chargement des datasets (.data / .solution / .type)
-•	preprocessing.py # Pré-traitement des données (imputation, encodage, scaling)
+•	automl.py :Pipeline AutoML principal
+
+•	dataio.py : Chargement des datasets (.data / .solution / .type)
+
+•	preprocessing.py : Pré-traitement des données (imputation, encodage, scaling)
+
 •	README.md
 
 
 ---
 
-## ⚙️ Fonctionnalités principales
+## Fonctionnalités principales
 
 - Détection automatique du type de tâche
 - Support des datasets :
@@ -40,43 +43,53 @@ L’objectif est de proposer un pipeline automatique capable de :
 
 ---
 
-## ▶️ Exemple d’utilisation
+## Exemple d’utilisation
 
 ```python
 import automl
 
-am = automl.AutoML(verbose=True, time_budget_sec=1800)
-am.fit("/info/corpus/ChallengeMachineLearning/data_A/data_A")
-
-result = am.eval()
+automl = automl.AutoML(verbose=True, time_budget_sec=1800)
+automl.fit("/info/corpus/ChallengeMachineLearning/data_A/data_A")
+result = automl.eval()
 print(result)
-
-am.refit_full_data()
-am.save("model_best.joblib")
+automl.refit_full_data()
+automl.save("model_best.joblib")
+path_to_testset = "/info/corpus/ChallengeMachineLearning/data_test/data_test.data"
+automl.predict(path_to_test)
 
 ```
 
-📊 Métriques utilisées
-Classification
+Métriques utilisées
+
+# Classification
+
 •	F1-score (macro)
+
 •	F1-score (weighted)
+
 •	Accuracy
-Régression
+
+# Régression
+
 •	R²
+
 •	MSE
+
 •	MAE
 
-🧪 Jeux de données
+# Jeux de données
 
 Les datasets utilisés suivent le format :
 
 •	.data : variables explicatives
+
 •	.solution : variables cibles
+
 •	.type : types des features (Numerical / Categorical)
 
-⚠️ Les datasets ne sont pas inclus dans ce dépôt.
+Les datasets ne sont pas inclus dans ce dépôt.
 
-👨‍🎓 Contexte académique
+Contexte académique
 
 Projet réalisé dans le cadre du Master 1 – Intelligence Artificielle
 Module : Méthodologie IA
