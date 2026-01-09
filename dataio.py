@@ -1,128 +1,115 @@
-import os
-import pandas as pd
+
+from __future__ import annotations
+
 import numpy as np
-from scipy.sparse import csr_matrix
+import pandas as pd
+from pathlib import Path
+from typing import List, Tuple
 
-def load_dataset(base_path: str, sparse_threshold=10000, max_samples=10000):
+__all__ = ["load_dataset"]
+
+# Strings interpreted as missing values
+NA_TOKENS = {"NaN", "nan", "NA", "N/A", "None", ""}
+
+
+def _first_nonempty_cols(path: str) -> int:
+    """Return the number of columns on the first non-empty line of a text file.
+
+    This helper counts the whitespace-separated tokens on the first non-empty
+    line.  It is used to infer the expected number of columns in the `.data`
+    and `.solution` files.
     """
-    Chargement ULTIME datasets Challenge ML.
-    Auto-détecte dense/sparse, limite RAM, gère data_H (301k features).
-    
-    Args:
-        sparse_threshold: active sparse si >N features
-        max_samples: limite samples pour tests
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                return len(line.split())
+    return 0
+
+
+def _read_types_safe(type_file: str, n_features: int) -> List[str]:
+    """Read feature types from a `.type` file.
+
+    If the file does not contain exactly ``n_features`` tokens, return a default
+    list of length ``n_features`` with the value "Numerical" for each feature.
     """
-    data_file = base_path + ".data"
-    type_file = base_path + ".type"
-    sol_file = base_path + ".solution"
-
-    for p in [data_file, type_file, sol_file]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Fichier introuvable : {p}")
-
-    # Types
+    tokens: List[str] = []
     with open(type_file, "r") as f:
-        types = [t.strip() for t in f.readlines() if t.strip()]
-    n_features = len(types)
-    print(f"Dataset: {os.path.basename(base_path)}, {n_features} features")
+        for line in f:
+            tokens.extend(line.split())
+    tokens = [t.strip() for t in tokens if t.strip()]
+    if len(tokens) != n_features:
+        return ["Numerical"] * n_features
+    return tokens
 
-    def collect_sparse_data(file_path, is_solution=False):
-        """Collecte triplets (row,col,value) pour CSR sparse."""
-        rows, cols, values = [], [], []
-        sample_id = 0
-        n_samples = 0
-        
-        with open(file_path, 'r') as f:
-            for line_num, line in enumerate(f):
-                if n_samples >= max_samples:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                
-                parts = line.split()
-                if not parts:
-                    continue
-                
-                has_sparse = any(':' in p for p in parts)
-                col_offset = 0
-                
-                for part in parts:
-                    if ':' in part:
-                        # Sparse: "496:7141"
-                        try:
-                            col_str, val_str = part.split(':', 1)
-                            col = int(col_str)
-                            val = np.nan if val_str.lower() in ['nan', 'nan'] else float(val_str)
-                            if 0 <= col < n_features:
-                                rows.append(sample_id)
-                                cols.append(col)
-                                values.append(val)
-                        except:
-                            continue
-                    else:
-                        # Dense
-                        try:
-                            val = np.nan if part.lower() in ['nan', 'nan'] else float(part)
-                            col = col_offset
-                            rows.append(sample_id)
-                            cols.append(col)
-                            values.append(val)
-                            col_offset += 1
-                        except:
-                            continue
-                
-                if has_sparse or col_offset > 0:
-                    sample_id += 1
-                    n_samples += 1
-        
-        return rows, cols, values, n_samples
 
-    # X data
-    print("📊 Parsing X...")
-    rows_x, cols_x, vals_x, n_samples_x = collect_sparse_data(data_file)
-    
-    if n_features > sparse_threshold:
-        print(f"🚀 SPARSE MODE ({n_features} feats)")
-        X = csr_matrix((vals_x, (rows_x, cols_x)), 
-                      shape=(n_samples_x, n_features))
-        X = pd.DataFrame.sparse.from_spmatrix(X)
-    else:
-        print("📦 DENSE MODE")
-        X = pd.DataFrame(np.full((n_samples_x, n_features), np.nan))
-        for r, c, v in zip(rows_x, cols_x, vals_x):
-            X.iloc[r, c] = v
+def _read_matrix_ragged(path: str, n_cols: int) -> pd.DataFrame:
+    """Read a whitespace-delimited matrix from a text file with variable row lengths.
 
-    # y solution (toujours dense)
-    print("📊 Parsing y...")
-    rows_y, cols_y, vals_y, n_samples_y = collect_sparse_data(sol_file, is_solution=True)
-    n_outputs = max(cols_y) + 1 if cols_y else 1
-    y = pd.DataFrame(np.full((n_samples_y, n_outputs), np.nan))
-    for r, c, v in zip(rows_y, cols_y, vals_y):
-        y.iloc[r, c] = v
+    Each line of ``path`` is split on whitespace.  Missing values encoded by
+    tokens in ``NA_TOKENS`` are replaced with ``numpy.nan``.  If a row has
+    fewer than ``n_cols`` elements, it is padded with ``numpy.nan``; if it has
+    more, it is truncated.  The resulting matrix is returned as a DataFrame.
+    ``pandas.to_numeric`` is used to convert each column to numeric dtype when
+    possible.  Columns that cannot be converted remain of dtype ``object``.
+    """
+    rows: list[list[object]] = []
+    with open(path, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                row = [np.nan] * n_cols
+            else:
+                # Replace missing tokens with NaN
+                row = [np.nan if p in NA_TOKENS else p for p in parts]
+                # Pad or truncate to the expected number of columns
+                if len(row) < n_cols:
+                    row += [np.nan] * (n_cols - len(row))
+                elif len(row) > n_cols:
+                    row = row[:n_cols]
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    # Convert columns to numeric when possible
+    for j in range(df.shape[1]):
+        df[j] = pd.to_numeric(df[j], errors="ignore")
+    return df
 
-    # Align shapes
-    min_samples = min(X.shape[0], y.shape[0])
-    X, y = X.iloc[:min_samples], y.iloc[:min_samples]
 
-    print(f"✅ X: {X.shape} ({getattr(X, 'nnz', 'N/A')} non-zeros), y: {y.shape}")
+def load_dataset(base_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Load a dataset consisting of `.data`, `.solution` and `.type` files.
+
+    Parameters
+    ----------
+    base_path : str
+        Path prefix to the dataset files (without extension).  For example,
+        ``base_path="/data/dataset_A"`` will load ``/data/dataset_A.data``,
+        ``/data/dataset_A.solution`` and ``/data/dataset_A.type``.
+
+    Returns
+    -------
+    X : pandas.DataFrame
+        The feature matrix.  Columns are indexed by integer position starting
+        at zero.
+    y : pandas.DataFrame
+        The target matrix.  Columns are indexed by integer position starting at
+        zero.  Even for a single-target task the return type is DataFrame.
+    types : list of str
+        A list describing the type of each feature.  Values are either
+        "Numerical" or "Categorical" (case-insensitive).  If the `.type` file
+        cannot be parsed, the default is to mark all features as numerical.
+    """
+    data_file = f"{base_path}.data"
+    type_file = f"{base_path}.type"
+    sol_file = f"{base_path}.solution"
+    # Infer matrix dimensions from the first non-empty lines
+    n_x = _first_nonempty_cols(data_file)
+    n_y = _first_nonempty_cols(sol_file)
+    types = _read_types_safe(type_file, n_x)
+    X = _read_matrix_ragged(data_file, n_x)
+    y = _read_matrix_ragged(sol_file, n_y)
+    # Align lengths for safety
+    if len(X) != len(y):
+        m = min(len(X), len(y))
+        X = X.iloc[:m].reset_index(drop=True)
+        y = y.iloc[:m].reset_index(drop=True)
     return X, y, types
-
-def load_all_datasets(root="/info/corpus/ChallengeMachineLearning", max_samples=1000):
-    """Test tous datasets avec limite RAM."""
-    results = {}
-    for name in ["data_A", "data_B", "data_C", "data_D", "data_E", "data_F", "data_G", "data_H"]:
-        print(f"\n🔵 {name}")
-        base_path = f"{root}/{name}/{name}"
-        try:
-            X, y, types = load_dataset(base_path, max_samples=max_samples)
-            results[name] = (X, y, types)
-        except Exception as e:
-            print(f"❌ {e}")
-    return results
-
-if __name__ == "__main__":
-    # Test data_H sans crash
-    base_path = "/info/corpus/ChallengeMachineLearning/data_H/data_H"
-    X, y, types = load_dataset(base_path, max_samples=5000)
-    print("🎉 data_H chargé !")
