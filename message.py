@@ -1,435 +1,446 @@
+
+from __future__ import annotations
+
+import time
+import joblib
 import numpy as np
 import pandas as pd
+import warnings
+from typing import Dict, Optional, Tuple
 
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    r2_score,
-    mean_squared_error,
-    mean_absolute_error,
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.metrics import accuracy_score, f1_score, r2_score, mean_squared_error, mean_absolute_error
+from sklearn.linear_model import (
+    LogisticRegression,
+    LinearRegression,
+    SGDClassifier,
+    SGDRegressor,
+    Ridge,
 )
-
-from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.ensemble import (
     RandomForestClassifier,
     RandomForestRegressor,
-    GradientBoostingClassifier,
-    GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
 )
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.utils import resample
 
 from dataio import load_dataset
 from preprocessing import DataPreprocessor
 
+__all__ = ["AutoML"]
+
 
 class AutoML:
-    """
-    AutoML simple et réutilisable pour les datasets du Challenge Machine Learning.
-
-    Fonctionnalités :
-    - Chargement des données (.data, .type, .solution) via dataio.load_dataset
-    - Pré-traitement automatique (imputation, encodage, normalisation) via DataPreprocessor
-    - Détection du type de tâche (classification ou régression)
-    - Gestion du multi-output (plusieurs colonnes de sortie)
-    - Entraînement de plusieurs modèles et sélection du meilleur selon une métrique principale
-      * Classification : F1 macro
-      * Régression : R²
-    - Évaluation du meilleur modèle avec plusieurs métriques
-    """
 
     def __init__(
         self,
-        task_type: str | None = None,
+        task_type: Optional[str] = None,
         test_size: float = 0.2,
         random_state: int = 42,
         verbose: bool = True,
+        time_budget_sec: Optional[int] = None,
+        cv_folds: int = 1,
     ) -> None:
-        """
-        Parameters
-        ----------
-        task_type : {"classification", "regression"} ou None
-            Si None, le type est détecté automatiquement à partir de y.
-        test_size : float
-            Proportion du jeu de validation (par défaut 0.2).
-        random_state : int
-            Graine de reproductibilité.
-        verbose : bool
-            Si True, affiche des logs détaillés pendant l'entraînement.
-        """
         self.task_type = task_type
         self.test_size = test_size
         self.random_state = random_state
         self.verbose = verbose
+        self.time_budget_sec = time_budget_sec
+        self.cv_folds = max(1, int(cv_folds))
+        self.preprocessor: Optional[DataPreprocessor] = None
+        self.best_model_: Optional[Pipeline] = None
+        self.best_model_name_: Optional[str] = None
+        self.best_score_: Optional[float] = None
+        self.metrics_: Optional[Dict[str, float]] = None
+        self.models_results_: list[Dict[str, object]] = []
+        self._X_full: Optional[pd.DataFrame] = None
+        self._y_full: Optional[np.ndarray] = None
 
-        self.preprocessor = None
-        self.best_model_ = None
-        self.best_model_name_: str | None = None
-        self.best_score_: float | None = None
-        self.metrics_: dict | None = None
-        self.models_results_: list[dict] = []
-
-    # ------------------------------------------------------------------ #
-    #  Helpers d'affichage                                               #
-    # ------------------------------------------------------------------ #
     def _log(self, msg: str) -> None:
         if self.verbose:
-            print(msg)
+            print(msg, flush=True)
 
     def _log_section(self, title: str) -> None:
         if not self.verbose:
             return
         bar = "=" * (len(title) + 4)
-        print(f"\n{bar}\n  {title}\n{bar}")
+        print(f"\n{bar}\n  {title}\n{bar}", flush=True)
 
-    # ------------------------------------------------------------------ #
-    #  Détection du type de tâche                                       #
-    # ------------------------------------------------------------------ #
-    def _infer_task_type(self, y) -> str:
-        """
-        Détecte automatiquement si la tâche est de classification ou de régression.
-
-        Règle simple :
-        - Si y est entier et avec peu de valeurs distinctes -> classification
-        - Sinon -> régression
-        """
-        y_flat = y.values if isinstance(y, pd.DataFrame) else np.asarray(y)
-
-        # Si multi-output, on inspecte la première colonne
-        if y_flat.ndim > 1:
-            col0 = y_flat[:, 0]
-        else:
-            col0 = y_flat
-
-        # On enlève les NaN (IMPUTE...)
+    def _infer_task_type(self, y_arr: np.ndarray) -> str:
+        col0 = y_arr[:, 0] if (y_arr.ndim > 1) else y_arr
         col0 = col0[~pd.isna(col0)]
-
-        # Cas pathologique : colonne vide
         if col0.size == 0:
             return "regression"
-
+        
         uniques = np.unique(col0)
-
-        # Si toutes les valeurs sont entières et peu nombreuses -> classification
         all_int = np.all(np.equal(np.mod(uniques, 1), 0))
-        if all_int and len(uniques) <= 20:
+        
+        if all_int and len(uniques) <= 50 and len(uniques) < len(col0) * 0.5:
             return "classification"
-
         return "regression"
 
-    # ------------------------------------------------------------------ #
-    #  Définition des modèles                                           #
-    # ------------------------------------------------------------------ #
-    def _get_models(self, task_type: str, n_outputs: int) -> dict:
-        """
-        Retourne un dictionnaire {nom: modèle} selon le type de tâche
-        et le nombre de sorties (multi-output ou non).
-        """
-        models: dict[str, object] = {}
-
+    def _get_models(self, task_type: str, n_outputs: int, n_samples: int, n_features: int) -> Dict[str, object]:
+        is_large = n_samples > 10000 or n_features > 500
+        is_very_large = n_samples > 50000 or n_features > 1000
+        is_multioutput_large = n_outputs > 50 
+        
         if task_type == "classification":
-            base_classifiers = {
-                "LogisticRegression": LogisticRegression(
-                    max_iter=1000, n_jobs=None
-                ),
-                "RandomForestClassifier": RandomForestClassifier(
-                    n_estimators=200,
-                    max_depth=None,
-                    n_jobs=-1,
+            base: Dict[str, object] = {}
+            
+            if not is_multioutput_large:
+                base["SGD_logloss"] = SGDClassifier(
+                    loss="log_loss", 
+                    alpha=1e-4, 
+                    max_iter=500 if is_large else 1000,
+                    tol=1e-3,
+                    class_weight="balanced",
                     random_state=self.random_state,
-                ),
-                "GradientBoostingClassifier": GradientBoostingClassifier(
-                    random_state=self.random_state
-                ),
-            }
-
-            if n_outputs > 1:
-                # Multi-output classification
-                for name, clf in base_classifiers.items():
-                    models[f"MultiOutput_{name}"] = MultiOutputClassifier(clf)
-            else:
-                models = base_classifiers
-
-        else:  # regression
-            base_regressors = {
-                "LinearRegression": LinearRegression(),
-                "RandomForestRegressor": RandomForestRegressor(
-                    n_estimators=200,
-                    max_depth=None,
-                    n_jobs=-1,
+                    n_jobs=1,
+                    verbose=0
+                )
+            
+            if not is_very_large and not is_multioutput_large:
+                base["LogisticRegression"] = LogisticRegression(
+                    max_iter=500 if is_large else 1000,
+                    solver="saga",
+                    class_weight="balanced",
                     random_state=self.random_state,
-                ),
-                "GradientBoostingRegressor": GradientBoostingRegressor(
-                    random_state=self.random_state
-                ),
-            }
-
+                    n_jobs=-1,
+                    tol=1e-3,
+                    verbose=0
+                )
+            
+            n_estimators = 50 if is_multioutput_large else (100 if is_large else 200)
+            max_depth = 15 if is_multioutput_large else (20 if is_large else None)
+            base["RandomForestClassifier"] = RandomForestClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                min_samples_split=10 if is_large else 2,
+                n_jobs=-1,
+                random_state=self.random_state,
+                verbose=0
+            )
+            
+            max_iter_gb = 50 if is_multioutput_large else (100 if is_large else 200)
+            base["HistGBClassifier"] = HistGradientBoostingClassifier(
+                max_iter=max_iter_gb,
+                max_depth=8 if is_large else 10,
+                random_state=self.random_state,
+                verbose=0
+            )
+            
             if n_outputs > 1:
-                # Multi-output regression
-                for name, reg in base_regressors.items():
-                    models[f"MultiOutput_{name}"] = MultiOutputRegressor(reg)
-            else:
-                models = base_regressors
-
-        return models
-
-    # ------------------------------------------------------------------ #
-    #  Évaluation d'un modèle                                           #
-    # ------------------------------------------------------------------ #
-    def _evaluate_classification(self, y_true, y_pred) -> dict:
-        """
-        Calcule les métriques pour la classification.
-        - F1 macro (métrique principale)
-        - F1 weighted
-        - Accuracy
-        """
-        y_true_arr = np.asarray(y_true)
-        y_pred_arr = np.asarray(y_pred)
-
-        # Gestion du multi-output : moyenne des scores sur chaque sortie
-        if y_true_arr.ndim == 1 or y_true_arr.shape[1] == 1:
-            f1_macro = f1_score(y_true_arr, y_pred_arr, average="macro")
-            f1_weighted = f1_score(y_true_arr, y_pred_arr, average="weighted")
-            acc = accuracy_score(y_true_arr, y_pred_arr)
+                return {f"MultiOutput_{k}": MultiOutputClassifier(v, n_jobs=1) for k, v in base.items()}
+            return base
         else:
-            f1_macro_list = []
-            f1_weighted_list = []
-            acc_list = []
-            for j in range(y_true_arr.shape[1]):
-                yt = y_true_arr[:, j]
-                yp = y_pred_arr[:, j]
-                f1_macro_list.append(f1_score(yt, yp, average="macro"))
-                f1_weighted_list.append(f1_score(yt, yp, average="weighted"))
-                acc_list.append(accuracy_score(yt, yp))
-            f1_macro = float(np.mean(f1_macro_list))
-            f1_weighted = float(np.mean(f1_weighted_list))
-            acc = float(np.mean(acc_list))
+            base = {}
+            
+            base["Ridge"] = Ridge(alpha=1.0, random_state=self.random_state)
+            
+            if not is_multioutput_large:
+                base["SGDRegressor"] = SGDRegressor(
+                    max_iter=500 if is_large else 1000,
+                    tol=1e-3,
+                    random_state=self.random_state,
+                    verbose=0
+                )
+            
+            if not is_very_large:
+                n_estimators = 50 if is_multioutput_large else (100 if is_large else 200)
+                base["RandomForestRegressor"] = RandomForestRegressor(
+                    n_estimators=n_estimators,
+                    max_depth=15 if is_large else 20,
+                    min_samples_split=10 if is_large else 2,
+                    n_jobs=-1,
+                    random_state=self.random_state,
+                    verbose=0
+                )
+            
+            max_iter_gb = 50 if is_multioutput_large else (100 if is_large else 200)
+            base["HistGBRegressor"] = HistGradientBoostingRegressor(
+                max_iter=max_iter_gb,
+                max_depth=8 if is_large else 10,
+                random_state=self.random_state,
+                verbose=0
+            )
+            
+            if n_outputs > 1:
+                return {f"MultiOutput_{k}": MultiOutputRegressor(v, n_jobs=1) for k, v in base.items()}
+            return base
 
-        return {
-            "main_score": f1_macro,
-            "f1_macro": f1_macro,
-            "f1_weighted": f1_weighted,
-            "accuracy": acc,
-        }
+    def _evaluate_classification(self, y_true, y_pred) -> Dict[str, float]:
+        try:
+            yt = np.asarray(y_true)
+            yp = np.asarray(y_pred)
+            if yt.ndim == 1 or yt.shape[1] == 1:
+                yt = yt.ravel()
+                yp = yp.ravel()
+                f1m = f1_score(yt, yp, average="macro", zero_division=0)
+                f1w = f1_score(yt, yp, average="weighted", zero_division=0)
+                acc = accuracy_score(yt, yp)
+            else:
+                f1m = float(np.mean([f1_score(yt[:, j], yp[:, j], average="macro", zero_division=0) for j in range(yt.shape[1])]))
+                f1w = float(np.mean([f1_score(yt[:, j], yp[:, j], average="weighted", zero_division=0) for j in range(yt.shape[1])]))
+                acc = float(np.mean([accuracy_score(yt[:, j], yp[:, j]) for j in range(yt.shape[1])]))
+            return {"main_score": f1m, "f1_macro": f1m, "f1_weighted": f1w, "accuracy": acc}
+        except Exception as e:
+            self._log(f"[WARN] Erreur métrique classification: {e}")
+            return {"main_score": 0.0, "f1_macro": 0.0, "f1_weighted": 0.0, "accuracy": 0.0}
 
-    def _evaluate_regression(self, y_true, y_pred) -> dict:
-        """
-        Calcule les métriques pour la régression.
-        - R² (métrique principale)
-        - MSE
-        - MAE
-        """
-        y_true_arr = np.asarray(y_true)
-        y_pred_arr = np.asarray(y_pred)
+    def _evaluate_regression(self, y_true, y_pred) -> Dict[str, float]:
+        try:
+            yt = np.asarray(y_true)
+            yp = np.asarray(y_pred)
+            if yt.ndim == 2 and yt.shape[1] == 1:
+                yt = yt.ravel()
+                yp = yp.ravel()
+            r2 = r2_score(yt, yp, multioutput="uniform_average")
+            mse = mean_squared_error(yt, yp)
+            mae = mean_absolute_error(yt, yp)
+            return {"main_score": r2, "r2": r2, "mse": mse, "mae": mae}
+        except Exception as e:
+            self._log(f"[WARN] Erreur métrique régression: {e}")
+            return {"main_score": 0.0, "r2": 0.0, "mse": 0.0, "mae": 0.0}
 
-        r2 = r2_score(y_true_arr, y_pred_arr, multioutput="uniform_average")
-        mse = mean_squared_error(y_true_arr, y_pred_arr)
-        mae = mean_absolute_error(y_true_arr, y_pred_arr)
+    def _check_data_quality(self, X, y_arr) -> Tuple[bool, str]:
+        if isinstance(X, pd.DataFrame):
+            nan_ratio = X.isna().sum().sum() / (X.shape[0] * X.shape[1])
+            if nan_ratio > 0.8:
+                return False, f"Trop de valeurs manquantes ({nan_ratio*100:.1f}%)"
+        
+        if isinstance(y_arr, np.ndarray):
+            if y_arr.ndim == 1:
+                valid_targets = ~pd.isna(y_arr)
+            else:
+                valid_targets = ~pd.isna(y_arr).any(axis=1)
+            
+            valid_ratio = valid_targets.sum() / len(y_arr)
+            if valid_ratio < 0.5:
+                return False, f"Trop peu de targets valides ({valid_ratio*100:.1f}%)"
+        
+        if self.task_type == "classification":
+            col0 = y_arr[:, 0] if (y_arr.ndim > 1) else y_arr
+            col0 = col0[~pd.isna(col0)]
+            if len(np.unique(col0)) < 2:
+                return False, "Une seule classe dans les targets"
+        
+        return True, "OK"
 
-        return {
-            "main_score": r2,
-            "r2": r2,
-            "mse": mse,
-            "mae": mae,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  Méthode principale d'entraînement                                #
-    # ------------------------------------------------------------------ #
     def fit(self, base_path: str) -> "AutoML":
-        """
-        Entraîne automatiquement plusieurs modèles sur le dataset spécifié
-        et garde le meilleur modèle selon la métrique principale.
-
-        Parameters
-        ----------
-        base_path : str
-            Chemin de base vers le dataset, par ex :
-            "/info/corpus/ChallengeMachineLearning/data_A/data_A"
-        """
-        self._log_section("Chargement des données")
-        self._log(f"[AutoML] Dataset : {base_path}")
-
-        # 1) Chargement des données
-        X, y, types = load_dataset(base_path)
-
-        if isinstance(y, pd.DataFrame):
-            y_arr = y.values
-        else:
-            y_arr = np.asarray(y)
-
-        self._log(f"[AutoML] X shape : {X.shape}, y shape : {y_arr.shape}")
-
-        # 2) Détection du type de tâche si non fourni
-        if self.task_type is None:
-            self.task_type = self._infer_task_type(y_arr)
-        self._log(f"[AutoML] Type de tâche : {self.task_type}")
-
-        # 3) Préprocesseur
-        self._log_section("Pré-traitement des données")
-        prep = DataPreprocessor(types)
-        self.preprocessor = prep.preprocessor
-
-        # 4) Split train / validation
-        X_train, X_val, y_train, y_val = prep.split(
-            X, y_arr, test_size=self.test_size, seed=self.random_state
-        )
-        self._log(
-            f"[AutoML] Split train/val : "
-            f"X_train={X_train.shape}, X_val={X_val.shape}"
-        )
-
-        n_outputs = y_train.shape[1] if y_train.ndim > 1 else 1
-
-        # 5) Définition des modèles candidats
-        models = self._get_models(self.task_type, n_outputs)
-        self.models_results_.clear()
-        self.best_model_ = None
-        self.best_model_name_ = None
-        self.best_score_ = None
-        self.metrics_ = None
-
-        self._log_section("Entraînement des modèles")
-        self._log(f"[AutoML] Nombre de modèles candidats : {len(models)}")
-
-        # 6) Boucle sur les modèles
-        for name, model in models.items():
-            self._log(f"\n[AutoML] → Modèle en cours : {name}")
-
-            pipeline = Pipeline(
-                [
+        start_overall = time.time()
+        
+        try:
+            self._log_section("Chargement des données")
+            self._log(f"[AutoML] Dataset : {base_path}")
+            
+            X, y, types = load_dataset(base_path)
+            y_arr = y.values if isinstance(y, pd.DataFrame) else np.asarray(y)
+            
+            if len(X) != len(y_arr):
+                m = min(len(X), len(y_arr))
+                self._log(f"[AutoML][WARN] Alignement X/y: {m} échantillons")
+                X = X.iloc[:m].reset_index(drop=True) if hasattr(X, "iloc") else X[:m]
+                y_arr = y_arr[:m]
+            
+            self._X_full = X
+            self._y_full = y_arr
+            self._log(f"[AutoML] X shape : {X.shape}, y shape : {y_arr.shape}")
+            
+            if self.task_type is None:
+                self.task_type = self._infer_task_type(y_arr)
+            self._log(f"[AutoML] Type de tâche : {self.task_type}")
+            
+            is_valid, message = self._check_data_quality(X, y_arr)
+            if not is_valid:
+                raise ValueError(f"Données invalides: {message}")
+            
+            self._log_section("Pré-traitement des données")
+            prep = DataPreprocessor(types)
+            self._prep = prep
+            
+            if self.cv_folds == 1:
+                X_train, X_val, y_train, y_val = prep.split(
+                    X, y_arr, test_size=self.test_size, seed=self.random_state, task_type=self.task_type
+                )
+                self.preprocessor = prep.preprocessor
+                
+                if isinstance(y_train, np.ndarray) and y_train.ndim == 2 and y_train.shape[1] == 1:
+                    y_train = y_train.ravel()
+                    y_val = y_val.ravel()
+                n_outputs = y_train.shape[1] if (isinstance(y_train, np.ndarray) and y_train.ndim > 1) else 1
+            else:
+                prep._categorize_features(types, X)
+                self.preprocessor = prep._build_preprocessor()
+                if prep._sparse_detected:
+                    X = prep._convert_sparse_to_numeric(X)
+                n_outputs = y_arr.shape[1] if (isinstance(y_arr, np.ndarray) and y_arr.ndim > 1) else 1
+            
+            models = self._get_models(self.task_type, n_outputs, X.shape[0], X.shape[1])
+            
+            self.models_results_.clear()
+            self.best_model_ = None
+            self.best_model_name_ = None
+            self.best_score_ = None
+            self.metrics_ = None
+            
+            self._log_section("Entraînement des modèles")
+            self._log(f"[AutoML] Modèles candidats : {list(models.keys())}")
+            if n_outputs > 50:
+                self._log(f"[AutoML] ⚠️  Multi-output large ({n_outputs} outputs) → SGD/LogReg désactivés")
+            
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            warnings.filterwarnings("ignore", category=UserWarning)
+            
+            successful_models = 0
+            
+            for name, model in models.items():
+                if self.time_budget_sec is not None and (time.time() - start_overall) > self.time_budget_sec:
+                    self._log("[AutoML] ⏱ Budget temps atteint → arrêt.")
+                    break
+                
+                self._log(f"\n[AutoML] → Modèle : {name}")
+                model_start = time.time()
+                
+                pipe = Pipeline([
                     ("preprocessor", self.preprocessor),
                     ("model", model),
-                ]
-            )
-
-            pipeline.fit(X_train, y_train)
-            y_pred = pipeline.predict(X_val)
-
-            # Évaluation
-            if self.task_type == "classification":
-                metrics = self._evaluate_classification(y_val, y_pred)
-            else:
-                metrics = self._evaluate_regression(y_val, y_pred)
-
-            main_score = metrics["main_score"]
-            self._log(f"[AutoML] Score principal ({self.task_type}) = {main_score:.4f}")
-
-            # Sauvegarde des résultats
-            self.models_results_.append(
-                {
-                    "name": name,
-                    "model": pipeline,
-                    "metrics": metrics,
-                }
-            )
-
-            # Mise à jour du meilleur modèle
-            if self.best_score_ is None or main_score > self.best_score_:
-                self.best_score_ = main_score
-                self.best_model_ = pipeline
-                self.best_model_name_ = name
-                self.metrics_ = metrics
-
-        # Résumé final
-        self._log_section("Résultat de la recherche de modèle")
-        self._log(f"[AutoML] Meilleur modèle : {self.best_model_name_}")
-        self._log(f"[AutoML] Score principal : {self.best_score_:.4f}")
-        if self.metrics_ is not None:
-            for k, v in self.metrics_.items():
-                if k == "main_score":
+                ])
+                
+                try:
+                    if self.cv_folds == 1:
+                        pipe.fit(X_train, y_train)
+                        y_pred = pipe.predict(X_val)
+                        
+                        if self.task_type == "classification":
+                            metrics = self._evaluate_classification(y_val, y_pred)
+                        else:
+                            metrics = self._evaluate_regression(y_val, y_pred)
+                        score = float(metrics["main_score"])
+                    else:
+                        if self.task_type == "classification" and (n_outputs == 1):
+                            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                        else:
+                            cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+                        
+                        scoring = "f1_macro" if self.task_type == "classification" else "r2"
+                        y_cv = y_arr
+                        if self.task_type == "classification" and y_arr.ndim == 2 and y_arr.shape[1] == 1:
+                            y_cv = y_arr.ravel()
+                        
+                        scores = cross_val_score(pipe, X, y_cv, cv=cv, scoring=scoring, n_jobs=1)
+                        score = float(scores.mean())
+                        metrics = {"main_score": score, scoring: score}
+                    
+                    successful_models += 1
+                    elapsed = time.time() - model_start
+                    self.models_results_.append({"name": name, "model": pipe, "metrics": metrics})
+                    
+                    if self.best_score_ is None or score > self.best_score_:
+                        self.best_score_ = score
+                        self.best_model_ = pipe
+                        self.best_model_name_ = name
+                        self.metrics_ = metrics
+                    
+                    self._log(f"[AutoML] ✓ Score = {score:.4f} (temps: {elapsed:.1f}s)")
+                    
+                except Exception as e:
+                    self._log(f"[AutoML][WARN] ✗ Modèle {name} a échoué: {str(e)[:100]}")
                     continue
-                self._log(f"[AutoML] {k} : {v:.4f}")
+            
+            if self.best_model_ is None:
+                raise RuntimeError(f"Aucun modèle n'a pu être entraîné. Testé {len(models)} modèles, {successful_models} réussis.")
+            
+            self._log_section("Résultat")
+            self._log(f"[AutoML] ✓ Best : {self.best_model_name_} | score={self.best_score_:.4f}")
+            self._log(f"[AutoML] Temps total: {time.time() - start_overall:.1f}s")
+            
+            return self
+            
+        except Exception as e:
+            self._log(f"[AutoML][ERROR] Erreur fatale: {e}")
+            raise
 
+    def refit_full_data(self) -> "AutoML":
+        if self.best_model_ is None:
+            raise RuntimeError("fit() doit être appelé avant refit_full_data().")
+        if self._X_full is None or self._y_full is None:
+            raise RuntimeError("Données complètes non disponibles.")
+        if self.preprocessor is None:
+            raise RuntimeError("Preprocessor non disponible.")
+        
+        y_full = self._y_full
+        if isinstance(y_full, np.ndarray) and y_full.ndim == 2 and y_full.shape[1] == 1:
+            y_full = y_full.ravel()
+        
+        self._log_section("Refit sur 100% des données")
+        
+        X_full = self._X_full
+        if hasattr(self, '_prep') and self._prep is not None:
+            if self._prep._sparse_detected:
+                X_full = self._prep._convert_sparse_to_numeric(X_full)
+        
+        self.best_model_.fit(X_full, y_full)
         return self
 
-    # ------------------------------------------------------------------ #
-    #  Évaluation du meilleur modèle                                     #
-    # ------------------------------------------------------------------ #
-    def eval(self, X_test=None, y_test=None) -> dict:
-        """
-        Évalue le meilleur modèle.
-
-        - Si X_test, y_test sont fournis : évaluation sur un jeu de test.
-        - Sinon : retourne simplement les métriques déjà calculées sur validation.
-
-        Returns
-        -------
-        dict : métriques calculées.
-        """
+    def eval(self, X_test: Optional[pd.DataFrame] = None, y_test: Optional[np.ndarray] = None) -> Dict[str, object]:
         if self.best_model_ is None:
-            raise RuntimeError(
-                "Le modèle n'a pas encore été entraîné. Appelez fit() d'abord."
-            )
-
-        # Si pas de données de test fournies, on retourne les métriques de validation
+            raise RuntimeError("fit() d'abord.")
         if X_test is None or y_test is None:
-            self._log_section("Évaluation (jeu de validation)")
-            self._log(
-                "[AutoML] Aucune donnée de test fournie. "
-                "Retour des métriques calculées sur la validation."
-            )
-            return {
-                "best_model": self.best_model_name_,
-                "task_type": self.task_type,
-                "metrics": self.metrics_,
-            }
-
-        # Sinon, on prédit sur X_test
-        self._log_section("Évaluation (jeu de test externe)")
+            return {"best_model": self.best_model_name_, "task_type": self.task_type, "metrics": self.metrics_}
+        
         y_pred = self.best_model_.predict(X_test)
-
         if self.task_type == "classification":
             metrics = self._evaluate_classification(y_test, y_pred)
         else:
             metrics = self._evaluate_regression(y_test, y_pred)
+        return {"best_model": self.best_model_name_, "task_type": self.task_type, "metrics": metrics}
 
-        self._log("[AutoML] Métriques sur le jeu de test :")
-        for k, v in metrics.items():
-            if k == "main_score":
-                continue
-            self._log(f"  - {k} : {v:.4f}")
-
-        return {
-            "best_model": self.best_model_name_,
-            "task_type": self.task_type,
-            "metrics": metrics,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  Prédiction sur de nouvelles données                               #
-    # ------------------------------------------------------------------ #
-    def predict(self, X_new):
-        """
-        Prédit les sorties pour de nouvelles données X_new.
-
-        - X_new doit avoir la même structure que X utilisée pendant fit().
-        - Le pré-traitement est appliqué automatiquement via le pipeline.
-
-        Returns
-        -------
-        np.ndarray : prédictions du meilleur modèle.
-        """
+    def predict(self, X_new) -> np.ndarray:
         if self.best_model_ is None:
-            raise RuntimeError(
-                "Aucun modèle entraîné. Appelez fit() avant predict()."
-            )
+            raise RuntimeError("fit() d'abord.")
+        
+        if hasattr(self, '_prep') and self._prep is not None and self._prep._sparse_detected:
+            if not isinstance(X_new, pd.DataFrame):
+                X_new = pd.DataFrame(X_new)
+            X_new = self._prep._convert_sparse_to_numeric(X_new)
+        
+        return self.best_model_.predict(X_new)
 
-        self._log("[AutoML] Prédiction sur de nouvelles données...")
-        y_pred = self.best_model_.predict(X_new)
-        return y_pred
+    def predict_proba(self, X_new) -> np.ndarray:
+        if self.best_model_ is None:
+            raise RuntimeError("fit() d'abord.")
+        
+        if hasattr(self, '_prep') and self._prep is not None and self._prep._sparse_detected:
+            if not isinstance(X_new, pd.DataFrame):
+                X_new = pd.DataFrame(X_new)
+            X_new = self._prep._convert_sparse_to_numeric(X_new)
+        
+        model = self.best_model_.named_steps["model"]
+        if hasattr(model, "predict_proba"):
+            return self.best_model_.predict_proba(X_new)
+        raise AttributeError(f"Le modèle {self.best_model_name_} ne supporte pas predict_proba().")
 
+    def save(self, path: str) -> None:
+        payload = {
+            "best_model": self.best_model_,
+            "best_model_name": self.best_model_name_,
+            "task_type": self.task_type,
+            "metrics": self.metrics_,
+            "random_state": self.random_state,
+            "prep": self._prep,
+        }
+        joblib.dump(payload, path)
 
-# ---------------------------------------------------------------------- #
-#  Exemple d'utilisation directe                                        #
-# ---------------------------------------------------------------------- #
-if __name__ == "__main__":
-    base_path = "/info/corpus/ChallengeMachineLearning/data_H/data_H"
-
-    automl = AutoML(task_type=None, verbose=True)
-    automl.fit(base_path)
-
-    results = automl.eval()
-    print("\n[AutoML] Résultats récapitulatifs :")
-    print(results)
-
+    @staticmethod
+    def load(path: str) -> "AutoML":
+        payload = joblib.load(path)
+        obj = AutoML(task_type=payload["task_type"], random_state=payload["random_state"], verbose=False)
+        obj.best_model_ = payload["best_model"]
+        obj.best_model_name_ = payload["best_model_name"]
+        obj.metrics_ = payload["metrics"]
+        obj._prep = payload.get("prep", None)
+        return obj
