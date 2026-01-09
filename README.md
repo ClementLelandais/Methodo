@@ -54,7 +54,7 @@ print(result)
 am.refit_full_data()
 am.save("model_best.joblib")
 
----
+```
 
 📊 Métriques utilisées
 Classification
