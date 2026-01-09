@@ -13,10 +13,10 @@ L’objectif est de proposer un pipeline automatique capable de :
 
 ## 📁 Structure du projet
 
-├── automl.py # Pipeline AutoML principal
-├── dataio.py # Chargement des datasets (.data / .solution / .type)
-├── preprocessing.py # Pré-traitement des données (imputation, encodage, scaling)
-├── README.md
+•	automl.py # Pipeline AutoML principal
+•	dataio.py # Chargement des datasets (.data / .solution / .type)
+•	preprocessing.py # Pré-traitement des données (imputation, encodage, scaling)
+•	README.md
 
 
 ---
@@ -70,11 +70,9 @@ Régression
 
 Les datasets utilisés suivent le format :
 
-.data : variables explicatives
-
-.solution : variables cibles
-
-.type : types des features (Numerical / Categorical)
+•	.data : variables explicatives
+•	.solution : variables cibles
+•	.type : types des features (Numerical / Categorical)
 
 ⚠️ Les datasets ne sont pas inclus dans ce dépôt.
 
