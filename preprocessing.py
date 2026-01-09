@@ -1,5 +1,5 @@
 """
-Data preprocessing utilities for AutoML with sparse format support.
+Utilitaires de pré-traitement des données pour AutoML avec support du format sparse.
 """
 
 from __future__ import annotations
@@ -17,27 +17,27 @@ __all__ = ["DataPreprocessor"]
 
 
 def _is_sparse_format(series: pd.Series) -> bool:
-    """Check if a series contains sparse format data (e.g., '111:1', '45:0.5')."""
+    """Vérifie si une série contient des données au format sparse (ex: '111:1', '45:0.5')."""
     if series.dtype != object:
         return False
     
-    # Sample first non-null values
+    # Échantillonne les premières valeurs non-nulles
     sample = series.dropna().head(100)
     if len(sample) == 0:
         return False
     
-    # Check if values match sparse format pattern
+    # Vérifie si les valeurs correspondent au pattern sparse
     sparse_count = 0
     for val in sample:
         if isinstance(val, str) and ':' in val:
             sparse_count += 1
     
-    # If >50% of values are sparse format, consider it sparse
+    # Si >50% des valeurs sont au format sparse, considère comme sparse
     return sparse_count / len(sample) > 0.5
 
 
 def _parse_sparse_column(series: pd.Series) -> pd.Series:
-    """Parse a sparse format column (e.g., '111:1') to numeric."""
+    """Parse une colonne au format sparse (ex: '111:1') vers numérique."""
     def parse_value(val):
         if pd.isna(val) or val == '':
             return np.nan
@@ -45,7 +45,7 @@ def _parse_sparse_column(series: pd.Series) -> pd.Series:
             return float(val)
         if isinstance(val, str):
             if ':' in val:
-                # Format: 'index:value' -> extract value
+                # Format: 'index:valeur' -> extraire la valeur
                 try:
                     return float(val.split(':')[1])
                 except (IndexError, ValueError):
@@ -56,9 +56,9 @@ def _parse_sparse_column(series: pd.Series) -> pd.Series:
 
 
 class DataPreprocessor:
-    """Preprocess numerical and categorical features for AutoML.
+    """Pré-traite les features numériques et catégorielles pour AutoML.
     
-    Now supports sparse format detection and conversion.
+    Supporte maintenant la détection et conversion du format sparse.
     """
 
     def __init__(self, types: Iterable[str]) -> None:
@@ -70,7 +70,7 @@ class DataPreprocessor:
         self._sparse_detected = False
 
     def _detect_sparse_features(self, X: pd.DataFrame) -> List[int]:
-        """Detect which features are in sparse format."""
+        """Détecte quelles features sont au format sparse."""
         sparse_cols = []
         for i, col in enumerate(X.columns):
             if _is_sparse_format(X[col]):
@@ -78,7 +78,7 @@ class DataPreprocessor:
         return sparse_cols
 
     def _convert_sparse_to_numeric(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Convert sparse format columns to numeric."""
+        """Convertit les colonnes au format sparse vers numérique."""
         X_converted = X.copy()
         
         for i in range(len(X_converted.columns)):
@@ -89,17 +89,17 @@ class DataPreprocessor:
         return X_converted
 
     def _categorize_features(self, types: List[str], X: Optional[pd.DataFrame] = None) -> None:
-        """Categorize features based on types and data inspection."""
+        """Catégorise les features selon les types et inspection des données."""
         if X is not None:
-            # Detect sparse features first
+            # Détecte d'abord les features sparse
             self.sparse_features = self._detect_sparse_features(X)
             if len(self.sparse_features) > 0:
                 self._sparse_detected = True
         
-        # Categorize based on types, excluding sparse features
+        # Catégorise selon les types, en excluant les features sparse
         for i, t in enumerate(types):
             if i in self.sparse_features:
-                # Sparse features are treated as numerical after conversion
+                # Les features sparse sont traitées comme numériques après conversion
                 self.numeric_features.append(i)
             elif t.lower() == "categorical":
                 self.categorical_features.append(i)
@@ -107,7 +107,7 @@ class DataPreprocessor:
                 self.numeric_features.append(i)
 
     def _build_preprocessor(self) -> ColumnTransformer:
-        """Build the ColumnTransformer that imputes and scales/encodes features."""
+        """Construit le ColumnTransformer qui impute et scale/encode les features."""
         transformers = []
         
         if len(self.numeric_features) > 0:
@@ -129,7 +129,7 @@ class DataPreprocessor:
             transformers.append(("cat", categorical_transformer, self.categorical_features))
         
         if len(transformers) == 0:
-            # Fallback: treat all as numeric
+            # Fallback: traite tout comme numérique
             numeric_transformer = Pipeline(
                 steps=[
                     ("imputer", SimpleImputer(strategy="mean")),
@@ -146,13 +146,13 @@ class DataPreprocessor:
         return transformer
 
     def fit_transform(self, X: pd.DataFrame) -> np.ndarray:
-        """Fit preprocessor and transform data."""
-        # Convert sparse format if detected
+        """Fit le préprocesseur et transforme les données."""
+        # Convertit le format sparse si détecté
         if self._sparse_detected or any(_is_sparse_format(X[col]) for col in X.columns):
             X = self._convert_sparse_to_numeric(X)
             self._sparse_detected = True
         
-        # Build preprocessor if not done yet
+        # Construit le préprocesseur si pas encore fait
         if self.preprocessor is None:
             self._categorize_features(self.types, X)
             self.preprocessor = self._build_preprocessor()
@@ -160,11 +160,11 @@ class DataPreprocessor:
         return self.preprocessor.fit_transform(X)
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:
-        """Transform data using fitted preprocessor."""
+        """Transforme les données avec le préprocesseur fitté."""
         if self.preprocessor is None:
-            raise RuntimeError("Preprocessor not fitted. Call fit_transform first.")
+            raise RuntimeError("Préprocesseur non fitté. Appelez fit_transform d'abord.")
         
-        # Convert sparse format if was detected during fit
+        # Convertit le format sparse si détecté lors du fit
         if self._sparse_detected:
             X = self._convert_sparse_to_numeric(X)
         
@@ -178,24 +178,24 @@ class DataPreprocessor:
         seed: int = 42,
         task_type: Optional[str] = None,
     ) -> Tuple:
-        """Split data into train and validation sets with optional stratification.
+        """Divise les données en ensembles d'entraînement et validation avec stratification optionnelle.
         
-        This method now handles sparse format conversion before splitting.
+        Cette méthode gère maintenant la conversion du format sparse avant division.
         """
-        # Convert X to DataFrame if needed
+        # Convertit X en DataFrame si nécessaire
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X)
         
-        # Detect and convert sparse format
+        # Détecte et convertit le format sparse
         self._categorize_features(self.types, X)
         if self._sparse_detected:
             X = self._convert_sparse_to_numeric(X)
         
-        # Build preprocessor
+        # Construit le préprocesseur
         if self.preprocessor is None:
             self.preprocessor = self._build_preprocessor()
         
-        # Prepare stratification
+        # Prépare la stratification
         stratify = None
         y_arr = np.asarray(y)
         if task_type == "classification":
